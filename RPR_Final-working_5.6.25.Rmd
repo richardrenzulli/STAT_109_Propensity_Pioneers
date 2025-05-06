@@ -1,0 +1,1239 @@
+---
+title: "STAT 109 - Propensity to Purchase Group Project - RPR"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-05-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(car)
+library(psych)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(caret)
+```
+
+```{r,eval=TRUE, fig.cap="Data Loading"}
+kaggle_training_data <- read.csv("~/Desktop/10102402/customer_propensity_training_sample.csv")
+kaggle_testing_data <- read.csv("~/Desktop/10102402/customer_propensity_testing_sample.csv")
+
+# Combine datasets
+original_data <- rbind(kaggle_training_data, kaggle_testing_data)
+
+# Create a working copy for cleaning and analysis
+total_data <- original_data
+```
+
+```{r,eval=TRUE, fig.cap="# Device Data Inspection and Cleaning"}
+# Check sums by device
+sums <- total_data %>% summarize(
+  mobile_users = sum(device_mobile),
+  tablet_users = sum(device_tablet),
+  computer_users = sum(device_computer)
+)
+print("Device Type Counts (Before Cleaning):")
+print(sums)
+
+# 1. Check for rows where ALL device variables are 0
+no_device_rows <- total_data %>%
+  filter(device_mobile == 0 & device_tablet == 0 & device_computer == 0)
+
+# 2. Count the number of such rows
+num_no_device_rows <- nrow(no_device_rows)
+print(paste("Number of rows with no device usage:", num_no_device_rows))
+
+# Check for any rows where more than one device is 1
+check_multiple <- total_data %>%
+  mutate(sum_devices = device_mobile + device_tablet + device_computer) %>%
+  filter(sum_devices > 1) %>%
+  collect() # Force evaluation
+
+if (nrow(check_multiple) > 0) {
+  print("Warning: Some observations use multiple devices!")
+} else {
+  print("No observations use multiple devices.")
+}
+
+device_table <- table(total_data$device_mobile, total_data$device_tablet, total_data$device_computer)
+print("Contingency Table of Devices (Before Cleaning):")
+print(device_table)
+
+# Output rows with more than 1 device type
+multiple_device_rows <- total_data %>%
+  mutate(sum_devices = device_mobile + device_tablet + device_computer) %>%
+  filter(sum_devices > 1) %>%
+  collect() # Force evaluation
+
+print("Rows with multiple devices:")
+print(multiple_device_rows)
+
+# Clean the data: Remove rows with more than 1 device type
+cleaned_data <- total_data %>%
+  mutate(sum_devices = device_mobile + device_tablet + device_computer) %>%
+  filter(sum_devices <= 1)
+
+# Assign the cleaned data back to total_data for further analysis
+total_data <- cleaned_data
+
+print(paste("Number of rows removed:", nrow(original_data) - nrow(total_data)))
+
+# Re-check to confirm cleaning
+sums_cleaned <- total_data %>% summarize(
+  mobile_users = sum(device_mobile),
+  tablet_users = sum(device_tablet),
+  computer_users = sum(device_computer)
+)
+print("Device Type Counts (After Cleaning):")
+print(sums_cleaned)
+
+check_multiple_cleaned <- total_data %>%
+  mutate(sum_devices = device_mobile + device_tablet + device_computer) %>%
+  filter(sum_devices > 1) %>%
+  collect()
+
+if (nrow(check_multiple_cleaned) > 0) {
+  print("Warning: Some observations STILL use multiple devices!")
+} else {
+  print("No observations use multiple devices.")
+}
+
+device_table_cleaned <- table(total_data$device_mobile, total_data$device_tablet, total_data$device_computer)
+print("Contingency Table of Devices (After Cleaning):")
+print(device_table_cleaned)
+
+#str(original_data)
+#str(total_data)
+```
+# An initial area of interest was device type, with three mutually exclusive variables: device_mobile (68%), device_computer (20%), and device_tablet (12%).
+
+# While zero observations had no device type selected; 1800 observations exhibited usage of multiple device types, an inconsistency given the assumption of unique sessions.  Being this is syntheitc data we have no recourse to discuss this with data collectors. With 607k observations we have we feel it's safe to remove these variations that account for less than .3% of the total data.
+
+
+```{r,eval=TRUE, fig.cap="Device Type Multicolinarity Check"}
+# Create a temporary data frame with the device variables
+device_data <- total_data %>%
+  select(device_mobile, device_tablet, device_computer)
+
+# Calculate the Variance Inflation Factor (VIF)
+vif_result <- vif(lm(device_mobile ~ device_tablet + device_computer, data = device_data))
+print("VIF for device variables:")
+print(vif_result)
+
+# Correlation Matrix (less useful with binary variables, but for completeness)
+cor_matrix <- cor(device_data)
+print("Correlation Matrix for device variables:")
+print(cor_matrix)
+
+pairs.panels(total_data[, c("device_mobile", "device_tablet", "device_computer")])
+
+```
+# The correlation matrix and pair.panels plot reveal strong negative correlations between device variables due to their mutually exclusive nature.  This mutually exclusivity is confirmed by the scatter plots (points at x=1 and y=1) and our intial analysis; which indicated negliable simultaneous use (< .3%)
+
+# Notebly, device_computer and device_mobile have the highest negative correlation -0.72; this is driving by them accounting for ~88% of the obversations; making them frequent alternatives.
+
+# As a secondary check, most ablicable to linear regression, the variance inflation factor (VIF) was low 1.03; not surprising this is not an indicator for multicolinarty. Nonetheless based on contextal expertise of mutual exclusion of device types, and the observed correlations, we know we need to address device type before modeling.
+
+
+```{r,eval=TRUE, fig.cap="# General Data Inspection and Cleaning"}
+# Remove UserID & sum_devices
+total_data <- total_data %>% select(-UserID)
+total_data <- total_data %>% select(-sum_devices)
+   
+# Convert relevant columns to factors and set reference
+total_data$ordered <- as.factor(total_data$ordered)
+total_data$ordered <- relevel(total_data$ordered, ref = "0")
+   
+factor_cols <- names(total_data)[names(total_data) != "ordered"]
+total_data[factor_cols] <- lapply(total_data[factor_cols], as.factor)
+
+str(total_data)
+```
+# To address the mutually exclusive relationship between device types, we explored multiple encoding methods (reference category, indicator variables, and one-hot encoding), all of which operate by establishing a baseline device type (in our case, the most observed: device_mobile) through the intercept and quantifying how device_computer and device_tablet differ in their impact on the outcome, in addition to the baseline of mobile. We also believe we should keep the intercept in our logistic regression to accurately account for this baseline effect.
+
+```{r,eval=TRUE, fig.cap="Baseline Logistic Regression - All Variables"}
+# Create a new data frame for the reference category approach
+total_data_logit <- total_data
+
+# Split data
+set.seed(1234)
+ind <- sample(2, nrow(total_data_logit), replace = T, prob = c(0.5, 0.5))
+train_base_5050 <- total_data_logit[ind == 1,]
+test_base_5050 <- total_data_logit[ind == 2,]
+   
+# Logistic Regression
+model_base <- glm(ordered ~ .,
+    data = train_base_5050,
+    family = binomial(link = "logit"))
+summary(model_base)
+
+# Test split confusion matrix
+p_base_5050test <- predict(model_base, test_base_5050, type = 'response')
+pred_base_5050test <- ifelse(p_base_5050test > 0.5, 1, 0)
+(cm_model_base_5050 <- confusionMatrix(factor(pred_base_5050test), test_base_5050$ordered, positive = '1'))
+
+
+# ROC
+r1_base_5050 <- roc(test_base_5050$ordered, p_base_5050test, percent = TRUE)
+
+plot.roc(r1_base_5050,
+         print.auc = T,
+         auc.polygon = T,
+         max.auc.polygon = T,
+         auc.polygon.col = 'lightblue',
+         print.thres = T,
+         main = 'ROC Curve - Baseline - All Variables')
+
+auc(r1_base_5050)
+
+(coords_base_5050 <- coords(r1_base_5050, "best", rest="threshold", transpose = FALSE))
+```
+```{r,eval=TRUE, fig.cap="Baseline Logistic Regression - Fitted - 14 Variables & Intercept"}
+# Logistic Regression
+model_base_fitted <- glm(ordered ~ basket_icon_click + 
+                            basket_add_list +
+                            basket_add_detail + 
+                            account_page_click + 
+                            detail_wishlist_add + 
+                            closed_minibasket_click + 
+                            checked_delivery_detail + 
+                            checked_returns_detail + 
+                            sign_in + 
+                            saw_delivery +
+                            saw_homepage + 
+                            device_mobile + 
+                            returning_user +
+                            loc_uk,
+    data = train_base_5050,
+    family = binomial(link = "logit"))
+summary(model_base_fitted)
+
+# Test split confusion matrix
+p_base_fitted_5050test <- predict(model_base_fitted, test_base_5050, type = 'response')
+pred_base_fitted_5050test <- ifelse(p_base_fitted_5050test > 0.5, 1, 0)
+(cm_model_base_fitted_5050 <- confusionMatrix(factor(pred_base_fitted_5050test), test_base_5050$ordered, positive = '1'))
+
+# ROC
+r1_base_fitted_5050 <- roc(test_base_5050$ordered, p_base_fitted_5050test, percent = TRUE)
+
+
+plot.roc(r1_base_fitted_5050,
+         print.auc = T,
+         auc.polygon = T,
+         max.auc.polygon = T,
+         auc.polygon.col = 'lightblue',
+         print.thres = T,
+         main = 'ROC Curve - Baseline - All Variables')
+
+auc(r1_base_fitted_5050)
+
+(coords_base_fitted_5050 <- coords(r1_base_fitted_5050, "best", rest="threshold", transpose = FALSE))
+```
+# 14 variables stat sig and intercept, device moible was statistically significant
+
+```{r,eval=TRUE, fig.cap="Device Multicolinarity Option 1 - Reference Category Encoding - All Variables"}
+# Create a new data frame for the reference category approach
+total_data_device_multicollinearity_option1 <- total_data %>%
+     select(-device_mobile)
+   
+# Verify the change
+print(names(total_data_device_multicollinearity_option1)) 
+print(head(total_data_device_multicollinearity_option1))
+
+# Split data
+set.seed(1234)
+ind <- sample(2, nrow(total_data_device_multicollinearity_option1), replace = T, prob = c(0.5, 0.5))
+train_mc_1_5050 <- total_data_device_multicollinearity_option1[ind == 1,]
+test_mc_1_5050 <- total_data_device_multicollinearity_option1[ind == 2,]
+   
+# Logistic Regression
+model_rce <- glm(ordered ~ .,
+    data = train_mc_1_5050,
+    family = binomial(link = "logit"))
+summary(model_rce)
+
+# Test split confusion matrix
+p_rce_5050test <- predict(model_rce, test_mc_1_5050, type = 'response')
+pred_rce_5050test <- ifelse(p_rce_5050test > 0.5, 1, 0)
+(cm_model_rce_5050 <- confusionMatrix(factor(pred_rce_5050test), test_mc_1_5050$ordered, positive = '1'))
+
+
+# ROC
+r1_rce_5050 <- roc(test_mc_1_5050$ordered, p_rce_5050test, percent = TRUE)
+
+plot.roc(r1_rce_5050,
+         print.auc = T,
+         auc.polygon = T,
+         max.auc.polygon = T,
+         auc.polygon.col = 'lightblue',
+         print.thres = T,
+         main = 'ROC Curve - Device Type RCE - All')
+
+auc(r1_rce_5050)
+
+(coords_rce_5050 <- coords(r1_rce_5050, "best", rest="threshold", transpose = FALSE))
+```
+
+
+# The coefficients for device_tablet and device_computer in your logistic regression will be interpreted relative to mobile usage. They tell you how tablet or computer usage affects the log-odds of the outcome compared to mobile usage.
+
+```{r,eval=TRUE, fig.cap="Device Multicolinarity Option 1 - Reference Category Encoding - Fitted 15 Variables & Intercept"}
+# Logistic Regression
+model_rce_fitted_5050 <- glm(formula = ordered ~ basket_icon_click + 
+                        basket_add_list + 
+                        basket_add_detail + 
+                        account_page_click + 
+                        detail_wishlist_add + 
+                        closed_minibasket_click + 
+                        checked_delivery_detail + 
+                        checked_returns_detail + 
+                        sign_in + 
+                        saw_delivery + 
+                        saw_homepage + 
+                        device_computer + 
+                        device_tablet + 
+                        returning_user + 
+                        loc_uk,
+    family = binomial(link = "logit"),
+    data = train_mc_1_5050)
+summary(model_rce_fitted_5050)
+
+# Test split confusion matrix
+p_rce_fitted_5050test <- predict(model_rce_fitted_5050, test_mc_1_5050, type = 'response')
+pred_rce_fitted_5050test <- ifelse(p_rce_fitted_5050test > 0.5, 1, 0)
+(cm_model_rce_fitted_5050 <- confusionMatrix(factor(pred_rce_fitted_5050test), test_mc_1_5050$ordered, positive = '1'))
+
+
+# ROC
+r1_rce_fitted_5050 <- roc(test_mc_1_5050$ordered, p_rce_fitted_5050test, percent = TRUE)
+
+plot.roc(r1_rce_fitted_5050,
+         print.auc = T,
+         auc.polygon = T,
+         max.auc.polygon = T,
+         auc.polygon.col = 'lightblue',
+         print.thres = T,
+         main = 'ROC Curve - Device Type RCE - Fitted')
+
+auc(r1_rce_fitted_5050)
+
+(coords_rce_fitted_5050 <- coords(r1_rce_fitted_5050, "best", rest="threshold", transpose = FALSE))
+```
+# 15 variables stat sig and intercept, device computer and tablet stat sig
+
+
+```{r,eval=TRUE, fig.cap="Device Multicolinarity Option 2 - Indicator Variable Encoding - All Variables"}
+# Create a new data frame for multicollinearity handling (Option 2)
+total_data_device_multicollinearity_option2 <- total_data
+
+# Create binary indicator for computer usage
+total_data_device_multicollinearity_option2$is_computer <- ifelse(total_data_device_multicollinearity_option2$device_computer == 1, 1, 0)
+
+# Create binary indicator for tablet usage
+total_data_device_multicollinearity_option2$is_tablet <- ifelse(total_data_device_multicollinearity_option2$device_tablet == 1, 1, 0)
+
+# Remove original device columns
+total_data_device_multicollinearity_option2 <- total_data_device_multicollinearity_option2[, !(names(total_data_device_multicollinearity_option2) %in% c("device_mobile", "device_computer", "device_tablet"))]
+
+# Split data
+set.seed(1234)
+ind <- sample(2, nrow(total_data_device_multicollinearity_option2), replace = T, prob = c(0.5, 0.5))
+train_mc_2_5050 <- total_data_device_multicollinearity_option2[ind == 1,]
+test_mc_2_5050 <- total_data_device_multicollinearity_option2[ind == 2,]
+   
+# Logistic Regression Model
+model_ive_5050 <- glm(ordered ~ .,
+                      data = train_mc_2_5050,
+                      family = binomial(link = "logit"))
+summary(model_ive_5050)
+
+# Test split confusion matrix
+p_ive_5050test <- predict(model_ive_5050, test_mc_2_5050, type = 'response')
+pred_ive_5050test <- ifelse(p_ive_5050test > 0.5, 1, 0)
+(cm_model_ive_5050 <- confusionMatrix(factor(pred_ive_5050test), test_mc_2_5050$ordered, positive = '1'))
+
+
+# ROC
+r1_ive_5050 <- roc(test_mc_2_5050$ordered, p_ive_5050test, percent = TRUE)
+
+plot.roc(r1_ive_5050,
+         print.auc = T,
+         auc.polygon = T,
+         max.auc.polygon = T,
+         auc.polygon.col = 'lightblue',
+         print.thres = T,
+         main = 'ROC Curve - Device Type IVE - All Variables')
+
+auc(r1_ive_5050)
+
+(coords_ive_5050 <- coords(r1_ive_5050, "best", rest="threshold", transpose = FALSE))
+```
+
+# The coefficients for is_computer and is_tablet will tell you the effect of computer and tablet usage, respectively. The effect of mobile usage is "absorbed" into the intercept of the model (the baseline log-odds when is_computer and is_tablet are both 0).
+
+```{r,eval=TRUE, fig.cap="Device Multicolinarity Option 2 - Indicator Variable Encoding - Fitted"}
+# Logistic Regression Model
+model_ive_fitted_5050 <- glm(ordered ~ basket_icon_click +
+                                      basket_add_list +
+                                      basket_add_detail +
+                                      detail_wishlist_add +
+                                      list_size_dropdown +
+                                      closed_minibasket_click +
+                                      checked_delivery_detail +
+                                      checked_returns_detail +
+                                      sign_in +
+                                      saw_delivery +
+                                      saw_homepage +
+                                      returning_user +
+                                      loc_uk +
+                                      is_computer +
+                                      is_tablet,
+                      data = train_mc_2_5050,
+                      family = binomial(link = "logit"))
+summary(model_ive_fitted_5050)
+
+# Test split confusion matrix
+p_ive_fitted_5050test <- predict(model_ive_fitted_5050, test_mc_2_5050, type = 'response')
+pred_ive_fitted_5050test <- ifelse(p_ive_fitted_5050test > 0.5, 1, 0)
+(cm_model_ive_fitted_5050 <- confusionMatrix(factor(pred_ive_fitted_5050test), test_mc_2_5050$ordered, positive = '1'))
+
+
+# ROC
+r1_ive_fitted_5050 <- roc(test_mc_2_5050$ordered, p_ive_fitted_5050test, percent = TRUE)
+
+plot.roc(r1_ive_fitted_5050,
+         print.auc = T,
+         auc.polygon = T,
+         max.auc.polygon = T,
+         auc.polygon.col = 'lightblue',
+         print.thres = T,
+         main = 'ROC Curve - Device Type IVE - Fitted')
+
+auc(r1_ive_fitted_5050)
+
+(coords_ive_fitted_5050 <- coords(r1_ive_fitted_5050, "best", rest="threshold", transpose = FALSE))
+```
+
+# 15 variable stat sig and intercept, computer and tablet stat sig
+
+```{r,eval=TRUE, fig.cap="Upsample and set up splits NEW"}
+# Define train-test splits and target variable to manage oversampling
+prepare_named_splits <- function(data,
+                                   data_prefix,
+                                   target = "ordered",
+                                   sample_size = NULL,
+                                   seed = 1234) {
+  set.seed(seed)
+
+  # Factorize target variable
+  data[[target]] <- factor(as.vector(data[[target]]), levels = c("0", "1"))
+
+  # Define stratified sampling (downsampling if sample_size is provided)
+  if (!is.null(sample_size)) {
+    sample_index <- createDataPartition(data[[target]], p = sample_size / nrow(data), list = FALSE)
+    data <- data[sample_index, ]
+    message("Sampled down to ", nrow(data), " rows.")
+  }
+
+  # Define split names/sizes
+  split_defs <- list("50" = 0.5, "60" = 0.6, "70" = 0.7, "80" = 0.8)
+
+  # Iterate over splits
+  for (split_name in names(split_defs)) {
+    train_frac <- split_defs[[split_name]]
+    test_frac <- 1 - train_frac
+    test_name <- as.character(round(test_frac * 100))
+
+    # Partition train/test data (no upsampling here)
+    train_index <- createDataPartition(data[[target]], p = train_frac, list = FALSE)
+    train_df <- data[train_index, ]
+    test_df  <- data[-train_index, ]
+
+    # Separate majority and minority classes in the training data
+    majority_class <- train_df %>% filter(!!sym(target) == "0")
+    minority_class <- train_df %>% filter(!!sym(target) == "1")
+
+    # Upsample the minority class to match the majority class size
+    if (nrow(minority_class) > 0) {
+      upsampled_minority <- minority_class[sample(1:nrow(minority_class),
+                                                 size = nrow(majority_class),
+                                                 replace = TRUE), ]
+      train_up_df <- rbind(majority_class, upsampled_minority)
+      train_up_df <- train_up_df[sample(nrow(train_up_df)), ] # Shuffle the rows
+    } else {
+      train_up_df <- train_df # If no minority class, no upsampling needed
+    }
+
+
+    # Define train control for cross-validation WITH upsampling
+    ctrl_up <- trainControl(
+      method = "repeatedcv",
+      number = 4,
+      repeats = 2,
+      allowParallel = TRUE,
+      sampling = "up", # Still specify "up" for trainControl's internal handling
+      classProbs = TRUE,
+      summaryFunction = twoClassSummary
+    )
+
+    # Construct persistent names
+    train_var <- paste0(data_prefix, "_train_", split_name)
+    test_var  <- paste0(data_prefix, "_test_", test_name)
+    train_up_var <- paste0(data_prefix, "_train_up_", split_name)
+
+    assign(train_var, train_df, envir = .GlobalEnv)
+    assign(test_var, test_df, envir = .GlobalEnv)
+    assign(train_up_var, train_up_df, envir = .GlobalEnv)
+
+    # Manage named output
+    message("Created: ", train_var, ", ", test_var, ", ", train_up_var)
+  }
+}
+
+# Apply the function to your cleaned total_data
+prepare_named_splits(total_data, "total_data", sample_size = NULL)
+
+```
+
+
+
+
+# Baseline upsample variables
+# 70/30 16 variables sat sig and intercept, mobile stat sig
+# 50/50 15 varibales sat sig and intercept, mobile stat sig
+# 60/40 14 variables stat sig and intercept (mobile, basket 1 2 3, checked 1 2, sign in)
+# 80/20 16 vairbles stat sig and intercept (mobile, sign_in, returning user, mobile, basked 123, checked 12)
+
+```{r,eval=TRUE, fig.cap="Baseline Logistic Regression - All Variables & Fitted - Upsample, 50/50"}
+# Baseline Logistic Regression - All Variables - Upsample - 50/50
+model_base_5050_up <- glm(ordered ~ .,
+                          data = total_data_train_up_50,
+                          family = binomial(link = "logit"))
+summary(model_base_5050_up)
+
+# Test split confusion matrix
+p_base_5050uptest <- predict(model_base_5050_up, total_data_test_50, type = 'response')
+pred_base_5050uptest <- ifelse(p_base_5050uptest > 0.5, 1, 0)
+(cm_model_base_5050_up <- confusionMatrix(factor(pred_base_5050uptest), total_data_test_50$ordered, positive = '1'))
+
+# ROC
+roc_base_5050up <- roc(total_data_test_50$ordered, p_base_5050uptest, percent = TRUE)
+
+plot(roc_base_5050up,
+     print.auc = TRUE,
+     auc.polygon = TRUE,
+     col = "lightblue",
+     main = 'ROC Curve - Baseline - All Variables (50/50 Split & Upsampled)')
+
+auc(roc_base_5050up)
+
+(coords_base_5050up <- coords(roc_base_5050up, "best", rest="threshold", transpose = FALSE))
+
+# Baseline Logistic Regression - Fitted - Upsample, 50/50
+model_base_fitted_5050_up <- glm(ordered ~ basket_icon_click +
+                                       basket_add_list +
+                                       basket_add_detail +
+                                       account_page_click +
+                                       detail_wishlist_add +
+                                       list_size_dropdown +
+                                       checked_delivery_detail +
+                                       checked_returns_detail +
+                                       sign_in +
+                                       saw_delivery +
+                                       saw_account_upgrade +
+                                       saw_homepage +
+                                       device_mobile +
+                                       returning_user +
+                                       loc_uk,
+                             data = total_data_train_up_50,
+                             family = binomial(link = "logit"))
+summary(model_base_fitted_5050_up)
+
+# Test split confusion matrix
+p_base_fitted_5050uptest <- predict(model_base_fitted_5050_up, total_data_test_50, type = 'response')
+pred_base_fitted_5050uptest <- ifelse(p_base_fitted_5050uptest > 0.5, 1, 0)
+(cm_model_base_fitted_5050_up <- confusionMatrix(factor(pred_base_fitted_5050uptest), total_data_test_50$ordered, positive = '1'))
+
+# ROC
+roc_base_fitted_5050up <- roc(total_data_test_50$ordered, p_base_fitted_5050uptest, percent = TRUE)
+
+plot(roc_base_fitted_5050up,
+     print.auc = TRUE,
+     auc.polygon = TRUE,
+     col = "lightblue",
+     main = 'ROC Curve - Baseline - Fitted (50/50 Split & Upsampled)')
+
+auc(roc_base_fitted_5050up)
+
+(coords_base_fitted_5050up <- coords(roc_base_fitted_5050up, "best", rest="threshold", transpose = FALSE))
+```
+
+```{r,eval=TRUE, fig.cap="Baseline Logistic Regression - All Variables & Fitted - Upsample, 60/40}
+# Baseline Logistic Regression - All Variables - Upsample, 60/40
+# Logistic Regression
+model_base_6040_up <- glm(ordered ~ .,
+                          data = total_data_train_up_60,
+                          family = binomial(link = "logit"))
+summary(model_base_6040_up)
+
+# Test split confusion matrix
+p_base_6040uptest <- predict(model_base_6040_up, total_data_test_40, type = 'response')
+pred_base_6040uptest <- ifelse(p_base_6040uptest > 0.5, 1, 0)
+(cm_model_base_6040_up <- confusionMatrix(factor(pred_base_6040uptest), total_data_test_40$ordered, positive = '1'))
+
+# ROC
+roc_base_6040up <- roc(total_data_test_40$ordered, p_base_6040uptest, percent = TRUE)
+
+plot(roc_base_6040up,
+     print.auc = TRUE,
+     auc.polygon = TRUE,
+     col = "lightblue",
+     main = 'ROC Curve - Baseline - All Variables (60/40 Split & Upsampled)')
+
+auc(roc_base_6040up)
+
+(coords_base_6040up <- coords(roc_base_6040up, "best", rest="threshold", transpose = FALSE))
+
+# Baseline Logistic Regression - Fitted - Upsample, 60/40
+# Logistic Regression
+model_base_fitted_6040_up <- glm(ordered ~ basket_icon_click +
+                                       basket_add_list +
+                                       basket_add_detail +
+                                       detail_wishlist_add +
+                                       list_size_dropdown +
+                                       checked_delivery_detail +
+                                       checked_returns_detail +
+                                       sign_in +
+                                       saw_delivery +
+                                       saw_account_upgrade +
+                                       saw_homepage +
+                                       device_mobile +
+                                       returning_user +
+                                       loc_uk,
+                             data = total_data_train_up_60,
+                             family = binomial(link = "logit"))
+summary(model_base_fitted_6040_up)
+
+# Test split confusion matrix
+p_base_fitted_6040uptest <- predict(model_base_fitted_6040_up, total_data_test_40, type = 'response')
+pred_base_fitted_6040uptest <- ifelse(p_base_fitted_6040uptest > 0.5, 1, 0)
+(cm_model_base_fitted_6040_up <- confusionMatrix(factor(pred_base_fitted_6040uptest), total_data_test_40$ordered, positive = '1'))
+
+# ROC
+roc_base_fitted_6040up <- roc(total_data_test_40$ordered, p_base_fitted_6040uptest, percent = TRUE)
+
+plot(roc_base_fitted_6040up,
+     print.auc = TRUE,
+     auc.polygon = TRUE,
+     col = "lightblue",
+     main = 'ROC Curve - Baseline - Fitted (60/40 Split & Upsampled)')
+
+auc(roc_base_fitted_6040up)
+
+(coords_base_fitted_6040up <- coords(roc_base_fitted_6040up, "best", rest="threshold", transpose = FALSE))
+```
+```{r,eval=TRUE, fig.cap="Baseline Logistic Regression - All Variables - Upsample, 70/30"}
+# Logistic Regression
+model_base_7030_up <- glm(ordered ~ .,
+                       data = total_data_train_up_70,
+                       family = binomial(link = "logit"))
+summary(model_base_7030_up)
+
+# Test split confusion matrix
+p_base_7030uptest <- predict(model_base_7030_up, total_data_test_30, type = 'response')
+pred_base_7030uptest <- ifelse(p_base_7030uptest > 0.5, 1, 0)
+(cm_model_base_7030_up <- confusionMatrix(factor(pred_base_7030uptest), total_data_test_30$ordered, positive = '1'))
+
+# ROC
+r1_base_7030up <- roc(total_data_test_30$ordered, p_base_7030uptest, percent = TRUE)
+
+plot.roc(r1_base_7030up,
+         print.auc = T,
+         auc.polygon = T,
+         max.auc.polygon = T,
+         auc.polygon.col = 'lightblue',
+         print.thres = T,
+         main = 'ROC Curve - Baseline - All Variables (70/30 Split & Upsampled)')
+
+auc(r1_base_7030up)
+
+(coords_base_7030up <- coords(r1_base_7030up, "best", rest="threshold", transpose = FALSE))
+```
+
+```{r,eval=TRUE, fig.cap="Baseline Logistic Regression - Fitted - Upsample, 70/30"}
+# Logistic Regression
+model_base_fitted_7030_up <- glm(ordered ~ basket_icon_click + 
+                            basket_add_list +
+                            basket_add_detail + 
+                            account_page_click +
+                            promo_banner_click +
+                            detail_wishlist_add +
+                            list_size_dropdown +
+                            checked_delivery_detail + 
+                            checked_returns_detail + 
+                            sign_in + 
+                            saw_delivery +
+                            saw_account_upgrade +
+                            saw_homepage + 
+                            device_mobile +
+                            returning_user +
+                            loc_uk,
+                       data = total_data_train_up_70,
+                       family = binomial(link = "logit"))
+summary(model_base_fitted_7030_up)
+
+# Test split confusion matrix
+p_base_fitted_7030uptest <- predict(model_base_fitted_7030_up, total_data_test_30, type = 'response')
+pred_base_fitted_7030uptest <- ifelse(p_base_fitted_7030uptest > 0.5, 1, 0)
+(cm_model_base_fitted_7030_up <- confusionMatrix(factor(pred_base_fitted_7030uptest), total_data_test_30$ordered, positive = '1'))
+
+# ROC
+r1_base_fitted_7030uptest <- roc(total_data_test_30$ordered, p_base_fitted_7030uptest, percent = TRUE)
+
+plot.roc(r1_base_fitted_7030uptest,
+         print.auc = T,
+         auc.polygon = T,
+         max.auc.polygon = T,
+         auc.polygon.col = 'lightblue',
+         print.thres = T,
+         main = 'ROC Curve - Baseline - Fitted (70/30 Split & Upsampled)')
+
+auc(r1_base_fitted_7030uptest)
+
+(coords_base_fitted_7030up <- coords(r1_base_fitted_7030uptest, "best", rest="threshold", transpose = FALSE))
+```
+
+```{r,eval=TRUE, fig.cap="Baseline Logistic Regression - All Variables & Fitted - Upsample, 80/20"}
+# Baseline Logistic Regression - All Variables - Upsample, 80/20
+# Logistic Regression
+model_base_8020_up <- glm(ordered ~ .,
+                          data = total_data_train_up_80,
+                          family = binomial(link = "logit"))
+summary(model_base_8020_up)
+
+# Test split confusion matrix
+p_base_8020uptest <- predict(model_base_8020_up, total_data_test_20, type = 'response')
+pred_base_8020uptest <- ifelse(p_base_8020uptest > 0.5, 1, 0)
+(cm_model_base_8020_up <- confusionMatrix(factor(pred_base_8020uptest), total_data_test_20$ordered, positive = '1'))
+
+# ROC
+roc_base_8020up <- roc(total_data_test_20$ordered, p_base_8020uptest, percent = TRUE)
+
+plot(roc_base_8020up,
+     print.auc = TRUE,
+     auc.polygon = TRUE,
+     col = "lightblue",
+     main = 'ROC Curve - Baseline - All Variables (80/20 Split & Upsampled)')
+
+auc(roc_base_8020up)
+
+(coords_base_8020up <- coords(roc_base_8020up, "best", rest="threshold", transpose = FALSE))
+
+# Baseline Logistic Regression - Fitted - Upsample, 80/20
+# Logistic Regression
+model_base_fitted_8020_up <- glm(ordered ~ basket_icon_click +
+                                       basket_add_list +
+                                       basket_add_detail +
+                                       account_page_click +
+                                       promo_banner_click +
+                                       detail_wishlist_add +
+                                       list_size_dropdown +
+                                       checked_delivery_detail +
+                                       checked_returns_detail +
+                                       sign_in +
+                                       saw_delivery +
+                                       saw_account_upgrade +
+                                       saw_homepage +
+                                       device_mobile +
+                                       returning_user +
+                                       loc_uk,
+                             data = total_data_train_up_80,
+                             family = binomial(link = "logit"))
+summary(model_base_fitted_8020_up)
+
+# Test split confusion matrix
+p_base_fitted_8020uptest <- predict(model_base_fitted_8020_up, total_data_test_20, type = 'response')
+pred_base_fitted_8020uptest <- ifelse(p_base_fitted_8020uptest > 0.5, 1, 0)
+(cm_model_base_fitted_8020_up <- confusionMatrix(factor(pred_base_fitted_8020uptest), total_data_test_20$ordered, positive = '1'))
+
+# ROC
+roc_base_fitted_8020up <- roc(total_data_test_20$ordered, p_base_fitted_8020uptest, percent = TRUE)
+
+plot(roc_base_fitted_8020up,
+     print.auc = TRUE,
+     auc.polygon = TRUE,
+     col = "lightblue",
+     main = 'ROC Curve - Baseline - Fitted (80/20 Split & Upsampled)')
+
+auc(roc_base_fitted_8020up)
+
+(coords_base_fitted_8020up <- coords(roc_base_fitted_8020up, "best", rest="threshold", transpose = FALSE))
+```
+```{r,eval=TRUE, fig.cap="Indicator Variable Encoding - Splits & Sampling Prep"}
+# Prepare data for Indicator Variable Encoding
+
+# Create indicator variables and remove original device columns for all splits
+train_mc_2_50 <- total_data_train_up_50 %>%
+  mutate(is_computer = as.factor(ifelse(device_computer == 1, 1, 0)),
+         is_tablet = as.factor(ifelse(device_tablet == 1, 1, 0))) %>%
+  select(-device_mobile, -device_computer, -device_tablet)
+
+test_mc_2_50 <- total_data_test_50 %>%
+  mutate(is_computer = as.factor(ifelse(device_computer == 1, 1, 0)),
+         is_tablet = as.factor(ifelse(device_tablet == 1, 1, 0))) %>%
+  select(-device_mobile, -device_computer, -device_tablet)
+
+train_mc_2_60 <- total_data_train_up_60 %>%
+  mutate(is_computer = as.factor(ifelse(device_computer == 1, 1, 0)),
+         is_tablet = as.factor(ifelse(device_tablet == 1, 1, 0))) %>%
+  select(-device_mobile, -device_computer, -device_tablet)
+
+test_mc_2_40 <- total_data_test_40 %>%
+  mutate(is_computer = as.factor(ifelse(device_computer == 1, 1, 0)),
+         is_tablet = as.factor(ifelse(device_tablet == 1, 1, 0))) %>%
+  select(-device_mobile, -device_computer, -device_tablet)
+
+train_mc_2_70 <- total_data_train_up_70 %>%
+  mutate(is_computer = as.factor(ifelse(device_computer == 1, 1, 0)),
+         is_tablet = as.factor(ifelse(device_tablet == 1, 1, 0))) %>%
+  select(-device_mobile, -device_computer, -device_tablet)
+
+test_mc_2_30 <- total_data_test_30 %>%
+  mutate(is_computer = as.factor(ifelse(device_computer == 1, 1, 0)),
+         is_tablet = as.factor(ifelse(device_tablet == 1, 1, 0))) %>%
+  select(-device_mobile, -device_computer, -device_tablet)
+
+train_mc_2_80 <- total_data_train_up_80 %>%
+  mutate(is_computer = as.factor(ifelse(device_computer == 1, 1, 0)),
+         is_tablet = as.factor(ifelse(device_tablet == 1, 1, 0))) %>%
+  select(-device_mobile, -device_computer, -device_tablet)
+
+test_mc_2_20 <- total_data_test_20 %>%
+  mutate(is_computer = as.factor(ifelse(device_computer == 1, 1, 0)),
+         is_tablet = as.factor(ifelse(device_tablet == 1, 1, 0))) %>%
+  select(-device_mobile, -device_computer, -device_tablet)
+
+```
+
+```{r,eval=TRUE, fig.cap="IVE Models - All Variables 50, 60, 70, 80 with Upsampling "}
+# 50/50 Split
+model_ive_all_50 <- glm(ordered ~ ., data = train_mc_2_50, family = binomial(link = "logit"))
+summary(model_ive_all_50)
+p_ive_all_50test <- predict(model_ive_all_50, test_mc_2_50, type = 'response')
+pred_ive_all_50test <- ifelse(p_ive_all_50test > 0.5, 1, 0)
+cm_model_ive_all_50 <- confusionMatrix(factor(pred_ive_all_50test), test_mc_2_50$ordered, positive = '1')
+roc_ive_all_50 <- roc(test_mc_2_50$ordered, p_ive_all_50test)
+coords_ive_all_50 <- coords(roc_ive_all_50, "best")
+
+# 60/40 Split
+model_ive_all_60 <- glm(ordered ~ ., data = train_mc_2_60, family = binomial(link = "logit"))
+summary(model_ive_all_60)
+p_ive_all_60test <- predict(model_ive_all_60, test_mc_2_40, type = 'response')
+pred_ive_all_60test <- ifelse(p_ive_all_60test > 0.5, 1, 0)
+cm_model_ive_all_60 <- confusionMatrix(factor(pred_ive_all_60test), test_mc_2_40$ordered, positive = '1')
+roc_ive_all_60 <- roc(test_mc_2_40$ordered, p_ive_all_60test)
+coords_ive_all_60 <- coords(roc_ive_all_60, "best")
+
+# 70/30 Split
+model_ive_all_70 <- glm(ordered ~ ., data = train_mc_2_70, family = binomial(link = "logit"))
+summary(model_ive_all_70)
+p_ive_all_70test <- predict(model_ive_all_70, test_mc_2_30, type = 'response')
+pred_ive_all_70test <- ifelse(p_ive_all_70test > 0.5, 1, 0)
+cm_model_ive_all_70 <- confusionMatrix(factor(pred_ive_all_70test), test_mc_2_30$ordered, positive = '1')
+roc_ive_all_70 <- roc(test_mc_2_30$ordered, p_ive_all_70test)
+coords_ive_all_70 <- coords(roc_ive_all_70, "best")
+
+# 80/20 Split
+model_ive_all_80 <- glm(ordered ~ ., data = train_mc_2_80, family = binomial(link = "logit"))
+summary(model_ive_all_80)
+p_ive_all_80test <- predict(model_ive_all_80, test_mc_2_20, type = 'response')
+pred_ive_all_80test <- ifelse(p_ive_all_80test > 0.5, 1, 0)
+cm_model_ive_all_80 <- confusionMatrix(factor(pred_ive_all_80test), test_mc_2_20$ordered, positive = '1')
+roc_ive_all_80 <- roc(test_mc_2_20$ordered, p_ive_all_80test)
+coords_ive_all_80 <- coords(roc_ive_all_80, "best")
+
+```
+
+```{r,eval=TRUE, fig.cap="IVE Models - Fitted 50, 60, 70, 80 with Upsampling "}
+# Fit and evaluate Indicator Variable Encoding - Fitted for each split
+
+# 50/50 Split
+model_ive_fitted_50 <- glm(ordered ~ basket_icon_click +
+                                  basket_add_list +
+                                  basket_add_detail +
+                                  detail_wishlist_add +
+                                  account_page_click +
+                                  detail_wishlist_add +
+                                  checked_delivery_detail +
+                                  checked_returns_detail +
+                                  sign_in +
+                                  saw_delivery +
+                                  saw_homepage +
+                                  returning_user +
+                                  loc_uk +
+                                  is_computer +
+                                  is_tablet,
+                            data = train_mc_2_50,
+                            family = binomial(link = "logit"))
+summary(model_ive_fitted_50)
+p_ive_fitted_50test <- predict(model_ive_fitted_50, test_mc_2_50, type = 'response')
+pred_ive_fitted_50test <- ifelse(p_ive_fitted_50test > 0.5, 1, 0)
+cm_model_ive_fitted_50 <- confusionMatrix(factor(pred_ive_fitted_50test), test_mc_2_50$ordered, positive = '1')
+roc_ive_fitted_50 <- roc(test_mc_2_50$ordered, p_ive_fitted_50test)
+coords_ive_fitted_50 <- coords(roc_ive_fitted_50, "best")
+
+# 60/40 Split
+model_ive_fitted_60 <- glm(ordered ~ basket_icon_click +
+                                  basket_add_list +
+                                  basket_add_detail +
+                                  detail_wishlist_add +
+                                  list_size_dropdown +
+                                  checked_delivery_detail +
+                                  checked_returns_detail +
+                                  sign_in +
+                                  saw_delivery +
+                                  saw_account_upgrade +
+                                  saw_homepage +
+                                  returning_user +
+                                  loc_uk +
+                                  is_computer +
+                                  is_tablet,
+                            data = train_mc_2_60,
+                            family = binomial(link = "logit"))
+summary(model_ive_fitted_60)
+p_ive_fitted_60test <- predict(model_ive_fitted_60, test_mc_2_40, type = 'response')
+pred_ive_fitted_60test <- ifelse(p_ive_fitted_60test > 0.5, 1, 0)
+cm_model_ive_fitted_60 <- confusionMatrix(factor(pred_ive_fitted_60test), test_mc_2_40$ordered, positive = '1')
+roc_ive_fitted_60 <- roc(test_mc_2_40$ordered, p_ive_fitted_60test)
+coords_ive_fitted_60 <- coords(roc_ive_fitted_60, "best")
+
+# 70/30 Split
+model_ive_fitted_70 <- glm(ordered ~ basket_icon_click +
+                                  basket_add_list +
+                                  basket_add_detail +
+                                  account_page_click +
+                                  promo_banner_click +
+                                  detail_wishlist_add +
+                                  list_size_dropdown +
+                                  checked_delivery_detail +
+                                  checked_returns_detail +
+                                  sign_in +
+                                  saw_delivery +
+                                  saw_homepage +
+                                  returning_user +
+                                  loc_uk +
+                                  is_computer +
+                                  is_tablet,
+                            data = train_mc_2_70,
+                            family = binomial(link = "logit"))
+summary(model_ive_fitted_70)
+p_ive_fitted_70test <- predict(model_ive_fitted_70, test_mc_2_30, type = 'response')
+pred_ive_fitted_70test <- ifelse(p_ive_fitted_70test > 0.5, 1, 0)
+cm_model_ive_fitted_70 <- confusionMatrix(factor(pred_ive_fitted_70test), test_mc_2_30$ordered, positive = '1')
+roc_ive_fitted_70 <- roc(test_mc_2_30$ordered, p_ive_fitted_70test)
+coords_ive_fitted_70 <- coords(roc_ive_fitted_70, "best")
+
+# 80/20 Split
+model_ive_fitted_80 <- glm(ordered ~ basket_icon_click +
+                                  basket_add_list +
+                                  basket_add_detail +
+                                  account_page_click +
+                                  promo_banner_click +
+                                  detail_wishlist_add +
+                                  list_size_dropdown +
+                                  closed_minibasket_click +
+                                  checked_delivery_detail +
+                                  checked_returns_detail +
+                                  sign_in +
+                                  saw_delivery +
+                                  saw_account_upgrade +
+                                  saw_homepage +
+                                  returning_user +
+                                  loc_uk +
+                                  is_computer +
+                                  is_tablet,
+                            data = train_mc_2_80,
+                            family = binomial(link = "logit"))
+summary(model_ive_fitted_80)
+p_ive_fitted_80test <- predict(model_ive_fitted_80, test_mc_2_20, type = 'response')
+pred_ive_fitted_80test <- ifelse(p_ive_fitted_80test > 0.5, 1, 0)
+cm_model_ive_fitted_80 <- confusionMatrix(factor(pred_ive_fitted_80test), test_mc_2_20$ordered, positive = '1')
+roc_ive_fitted_80 <- roc(test_mc_2_20$ordered, p_ive_fitted_80test)
+coords_ive_fitted_80 <- coords(roc_ive_fitted_80, "best")
+```
+
+```{r,eval=TRUE, fig.cap="Compare Baseline, RCE & IVE"}
+# Extract specificity from each model (including upsampled)
+sensitivity_base_5050 <- cm_model_base_5050$byClass['Sensitivity']
+sensitivity_base_fitted_5050 <- cm_model_base_fitted_5050$byClass['Sensitivity']
+sensitivity_rce_5050 <- cm_model_rce_5050$byClass['Sensitivity']
+sensitivity_rce_fitted_5050 <- cm_model_rce_fitted_5050$byClass['Sensitivity']
+sensitivity_ive_5050 <- cm_model_ive_5050$byClass['Sensitivity']
+sensitivity_ive_fitted_5050 <- cm_model_ive_fitted_5050$byClass['Sensitivity']
+
+# Extract AIC values (including upsampled - if you ran them)
+aic_baseline <- AIC(model_base)
+aic_baseline_fitted <- AIC(model_base_fitted)
+aic_rce <- AIC(model_rce)
+aic_rce_fitted_5050 <- AIC(model_rce_fitted_5050)
+aic_ive_5050 <- AIC(model_ive_5050)
+aic_ive_fitted_5050 <- AIC(model_ive_fitted_5050)
+
+# Create the combined table with adjusted column order and titles
+all_models_comparison <- data.frame(
+  Model = c("Baseline Logit All (50/50)",
+            "Baseline Logit Fitted (50/50)",
+            "Reference Category Encoding All (50/50)",
+            "Reference Category Encoding Fitted (50/50)",
+            "Indicator Variable Encoding All (50/50)",
+            "Indicator Variable Encoding Fitted (50/50)"),
+  Sensitivity = c(sensitivity_base_5050,
+                  sensitivity_base_fitted_5050,
+                  sensitivity_rce_5050,
+                  sensitivity_rce_fitted_5050,
+                  sensitivity_ive_5050,
+                  sensitivity_ive_fitted_5050),
+  AIC = c(aic_baseline,
+          aic_baseline_fitted,
+          aic_rce,
+          aic_rce_fitted_5050,
+          aic_ive_5050,
+          aic_ive_fitted_5050),
+  Sensitivity_At_Best = c(coords_base_5050$sensitivity,
+                            coords_base_fitted_5050$sensitivity,
+                            coords_rce_5050$sensitivity,
+                            coords_rce_fitted_5050$sensitivity,
+                            coords_ive_5050$sensitivity,
+                            coords_ive_fitted_5050$sensitivity),
+  `Best Threshold` = c(coords_base_5050$threshold,
+                     coords_base_fitted_5050$threshold,
+                     coords_rce_5050$threshold,
+                     coords_rce_fitted_5050$threshold,
+                     coords_ive_5050$threshold,
+                     coords_ive_fitted_5050$threshold)
+)
+
+# Print the combined table
+print(all_models_comparison)
+```
+
+```{r,eval=TRUE, fig.cap="Compare Baseline with Upsamples"}
+# Extract specificity from upsampled base models
+sensitivity_base_5050_up <- cm_model_base_5050_up$byClass['Sensitivity']
+sensitivity_base_fitted_5050_up <- cm_model_base_fitted_5050_up$byClass['Sensitivity']
+sensitivity_base_6040_up <- cm_model_base_6040_up$byClass['Sensitivity']
+sensitivity_base_fitted_6040_up <- cm_model_base_fitted_6040_up$byClass['Sensitivity']
+sensitivity_base_7030_up <- cm_model_base_7030_up$byClass['Sensitivity']
+sensitivity_base_fitted_7030_up <- cm_model_base_fitted_7030_up$byClass['Sensitivity']
+sensitivity_base_8020_up <- cm_model_base_8020_up$byClass['Sensitivity']
+sensitivity_base_fitted_8020_up <- cm_model_base_fitted_8020_up$byClass['Sensitivity']
+
+# Extract AIC values from upsampled base models
+aic_base_5050_up <- AIC(model_base_5050_up)
+aic_base_fitted_5050_up <- AIC(model_base_fitted_5050_up)
+aic_base_6040_up <- AIC(model_base_6040_up)
+aic_base_fitted_6040_up <- AIC(model_base_fitted_6040_up)
+aic_base_7030_up <- AIC(model_base_7030_up)
+aic_base_fitted_7030_up <- AIC(model_base_fitted_7030_up)
+aic_base_8020_up <- AIC(model_base_8020_up)
+aic_base_fitted_8020_up <- AIC(model_base_fitted_8020_up)
+
+# Calculate AUC for each model
+auc_base_5050_up <- auc(roc_base_5050up)
+auc_base_fitted_5050_up <- auc(roc_base_fitted_5050up)
+auc_base_6040_up <- auc(roc_base_6040up)
+auc_base_fitted_6040_up <- auc(roc_base_fitted_6040up)
+auc_base_7030_up <- auc(r1_base_7030up)
+auc_base_fitted_7030_up <- auc(r1_base_fitted_7030uptest)
+auc_base_8020_up <- auc(roc_base_8020up)
+auc_base_fitted_8020_up <- auc(roc_base_fitted_8020up)
+
+# Create a data frame for the upsampled baseline models across all splits
+baseline_up_models_comparison <- data.frame(
+  Model = c("Baseline Logit All (50/50 Upsample)",
+            "Baseline Logit Fitted (50/50 Upsample)",
+            "Baseline Logit All (60/40 Upsample)",
+            "Baseline Logit Fitted (60/40 Upsample)",
+            "Baseline Logit All (70/30 Upsample)",
+            "Baseline Logit Fitted (70/30 Upsample)",
+            "Baseline Logit All (80/20 Upsample)",
+            "Baseline Logit Fitted (80/20 Upsample)"),
+  Sensitivity = c(sensitivity_base_5050_up,
+                  sensitivity_base_fitted_5050_up,
+                  sensitivity_base_6040_up,
+                  sensitivity_base_fitted_6040_up,
+                  sensitivity_base_7030_up,
+                  sensitivity_base_fitted_7030_up,
+                  sensitivity_base_8020_up,
+                  sensitivity_base_fitted_8020_up),
+  AIC = c(aic_base_5050_up,
+          aic_base_fitted_5050_up,
+          aic_base_6040_up,
+          aic_base_fitted_6040_up,
+          aic_base_7030_up,
+          aic_base_fitted_7030_up,
+          aic_base_8020_up,
+          aic_base_fitted_8020_up),
+  AUC = c(auc_base_5050_up,
+          auc_base_fitted_5050_up,
+          auc_base_6040_up,
+          auc_base_fitted_6040_up,
+          auc_base_7030_up,
+          auc_base_fitted_7030_up,
+          auc_base_8020_up,
+          auc_base_fitted_8020_up),
+  Sensitivity_At_Best = c(coords_base_5050up$sensitivity,
+                            coords_base_fitted_5050up$sensitivity,
+                            coords_base_6040up$sensitivity,
+                            coords_base_fitted_6040up$sensitivity,
+                            coords_base_7030up$sensitivity,
+                            coords_base_fitted_7030up$sensitivity,
+                            coords_base_8020up$sensitivity,
+                            coords_base_fitted_8020up$sensitivity),
+  `Best Threshold` = c(coords_base_5050up$threshold,
+                     coords_base_fitted_5050up$threshold,
+                     coords_base_6040up$threshold,
+                     coords_base_fitted_6040up$threshold,
+                     coords_base_7030up$threshold,
+                     coords_base_fitted_7030up$threshold,
+                     coords_base_8020up$threshold,
+                     coords_base_fitted_8020up$threshold)
+)
+
+# Print the combined table
+print(baseline_up_models_comparison)
+```
+```{r,eval=TRUE, fig.cap="Compare IVE Models"}
+# Compare Indicator Variable Encoding Models with Upsampling Across Different Splits
+
+# Extract specificity from upsampled IVE models
+sensitivity_ive_all_50_up <- cm_model_ive_all_50$byClass['Sensitivity']
+sensitivity_ive_fitted_50_up <- cm_model_ive_fitted_50$byClass['Sensitivity']
+sensitivity_ive_all_60_up <- cm_model_ive_all_60$byClass['Sensitivity']
+sensitivity_ive_fitted_60_up <- cm_model_ive_fitted_60$byClass['Sensitivity']
+sensitivity_ive_all_70_up <- cm_model_ive_all_70$byClass['Sensitivity']
+sensitivity_ive_fitted_70_up <- cm_model_ive_fitted_70$byClass['Sensitivity']
+sensitivity_ive_all_80_up <- cm_model_ive_all_80$byClass['Sensitivity']
+sensitivity_ive_fitted_80_up <- cm_model_ive_fitted_80$byClass['Sensitivity']
+
+# Extract AIC values from upsampled IVE models
+aic_ive_all_50_up <- AIC(model_ive_all_50)
+aic_ive_fitted_50_up <- AIC(model_ive_fitted_50)
+aic_ive_all_60_up <- AIC(model_ive_all_60)
+aic_ive_fitted_60_up <- AIC(model_ive_fitted_60)
+aic_ive_all_70_up <- AIC(model_ive_all_70)
+aic_ive_fitted_70_up <- AIC(model_ive_fitted_70)
+aic_ive_all_80_up <- AIC(model_ive_all_80)
+aic_ive_fitted_80_up <- AIC(model_ive_fitted_80)
+
+# Calculate AUC for each model
+auc_ive_all_50_up <- auc(roc_ive_all_50)
+auc_ive_fitted_50_up <- auc(roc_ive_fitted_50)
+auc_ive_all_60_up <- auc(roc_ive_all_60)
+auc_ive_fitted_60_up <- auc(roc_ive_fitted_60)
+auc_ive_all_70_up <- auc(roc_ive_all_70)
+auc_ive_fitted_70_up <- auc(roc_ive_fitted_70)
+auc_ive_all_80_up <- auc(roc_ive_all_80)
+auc_ive_fitted_80_up <- auc(roc_ive_fitted_80)
+
+# Extract Precision for each model
+precision_ive_all_50_up <- cm_model_ive_all_50$byClass['Precision']
+precision_ive_fitted_50_up <- cm_model_ive_fitted_50$byClass['Precision']
+precision_ive_all_60_up <- cm_model_ive_all_60$byClass['Precision']
+precision_ive_fitted_60_up <- cm_model_ive_fitted_60$byClass['Precision']
+precision_ive_all_70_up <- cm_model_ive_all_70$byClass['Precision']
+precision_ive_fitted_70_up <- cm_model_ive_fitted_70$byClass['Precision']
+precision_ive_all_80_up <- cm_model_ive_all_80$byClass['Precision']
+precision_ive_fitted_80_up <- cm_model_ive_fitted_80$byClass['Precision']
+
+# Extract F1-Score for each model
+f1_ive_all_50_up <- cm_model_ive_all_50$byClass['F1']
+f1_ive_fitted_50_up <- cm_model_ive_fitted_50$byClass['F1']
+f1_ive_all_60_up <- cm_model_ive_all_60$byClass['F1']
+f1_ive_fitted_60_up <- cm_model_ive_fitted_60$byClass['F1']
+f1_ive_all_70_up <- cm_model_ive_all_70$byClass['F1']
+f1_ive_fitted_70_up <- cm_model_ive_fitted_70$byClass['F1']
+f1_ive_all_80_up <- cm_model_ive_all_80$byClass['F1']
+f1_ive_fitted_80_up <- cm_model_ive_fitted_80$byClass['F1']
+
+# Create a data frame for the upsampled IVE models across all splits
+ive_up_models_comparison <- data.frame(
+  Model = c("IVE All (50/50 Upsample)",
+            "IVE Fitted (50/50 Upsample)",
+            "IVE All (60/40 Upsample)",
+            "IVE Fitted (60/40 Upsample)",
+            "IVE All (70/30 Upsample)",
+            "IVE Fitted (70/30 Upsample)",
+            "IVE All (80/20 Upsample)",
+            "IVE Fitted (80/20 Upsample)"),
+  Sensitivity = c(sensitivity_ive_all_50_up,
+                  sensitivity_ive_fitted_50_up,
+                  sensitivity_ive_all_60_up,
+                  sensitivity_ive_fitted_60_up,
+                  sensitivity_ive_all_70_up,
+                  sensitivity_ive_fitted_70_up,
+                  sensitivity_ive_all_80_up,
+                  sensitivity_ive_fitted_80_up),
+  AIC = c(aic_ive_all_50_up,
+          aic_ive_fitted_50_up,
+          aic_ive_all_60_up,
+          aic_ive_fitted_60_up,
+          aic_ive_all_70_up,
+          aic_ive_fitted_70_up,
+          aic_ive_all_80_up,
+          aic_ive_fitted_80_up),
+  AUC = c(auc_ive_all_50_up,
+          auc_ive_fitted_50_up,
+          auc_ive_all_60_up,
+          auc_ive_fitted_60_up,
+          auc_ive_all_70_up,
+          auc_ive_fitted_70_up,
+          auc_ive_all_80_up,
+          auc_ive_fitted_80_up),
+  Precision = c(precision_ive_all_50_up,
+                precision_ive_fitted_50_up,
+                precision_ive_all_60_up,
+                precision_ive_fitted_60_up,
+                precision_ive_all_70_up,
+                precision_ive_fitted_70_up,
+                precision_ive_all_80_up,
+                precision_ive_fitted_80_up),
+  F1_Score = c(f1_ive_all_50_up,
+               f1_ive_fitted_50_up,
+               f1_ive_all_60_up,
+               f1_ive_fitted_60_up,
+               f1_ive_all_70_up,
+               f1_ive_fitted_70_up,
+               f1_ive_all_80_up,
+               f1_ive_fitted_80_up),
+  Best_Threshold = c(coords_ive_all_50$threshold,
+                     coords_ive_fitted_50$threshold,
+                     coords_ive_all_60$threshold,
+                     coords_ive_fitted_60$threshold,
+                     coords_ive_all_70$threshold,
+                     coords_ive_fitted_70$threshold,
+                     coords_ive_all_80$threshold,
+                     coords_ive_fitted_80$threshold),
+  Sensitivity_At_Best = c(coords_ive_all_50$sensitivity,
+                            coords_ive_fitted_50$sensitivity,
+                            coords_ive_all_60$sensitivity,
+                            coords_ive_fitted_60$sensitivity,
+                            coords_ive_all_70$sensitivity,
+                            coords_ive_fitted_70$sensitivity,
+                            coords_ive_all_80$sensitivity,
+                            coords_ive_fitted_80$sensitivity)
+)
+
+# Print the combined table
+print(ive_up_models_comparison)
+```
+
+```{r,eval=TRUE, fig.cap="Compare Coords"}
+
+```
+
+
+
